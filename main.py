@@ -23,7 +23,7 @@ load_dotenv()
 # ============================================================
 # PATHS
 # ============================================================
-BASE_PATH = r"E:\Dalil_Project_py\Dalil\data"
+BASE_PATH = os.getcwd()
 SOURCE_DATA_PATH = os.path.join(BASE_PATH, "Source_data")
 VECTOR_DB_PATH   = os.path.join(BASE_PATH, "vector_db_index")
 LOG_FILE_PATH    = os.path.join(BASE_PATH, "admin_knowledge_base.txt")
@@ -33,7 +33,7 @@ LOG_FILE_PATH    = os.path.join(BASE_PATH, "admin_knowledge_base.txt")
 # ============================================================
 print("⏳ Loading LLM and embeddings...")
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1)
-embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 print("✅ LLM and embeddings ready.")
 
 # ============================================================
