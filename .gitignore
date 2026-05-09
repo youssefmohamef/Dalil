@@ -5,3 +5,4 @@ __pycache__/
 *.dll
 *.pyc
 .env
+data/
