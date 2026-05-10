@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,6 +7,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import os
+import shutil
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import DirectoryLoader, CSVLoader, TextLoader, PyPDFLoader
@@ -19,7 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 load_dotenv()
-
+groq_api_key = os.getenv("GROQ_API_KEY")
 # ============================================================
 # PATHS
 # ============================================================
@@ -31,9 +32,10 @@ LOG_FILE_PATH    = os.path.join(BASE_PATH, "admin_knowledge_base.txt")
 # ============================================================
 # LLM & EMBEDDINGS
 # ============================================================
+
 print("⏳ Loading LLM and embeddings...")
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1)
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
 print("✅ LLM and embeddings ready.")
 
 # ============================================================
@@ -284,6 +286,18 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         "role": user["role"],
         "username": user["username"]
     }
+
+@app.post("/admin/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    # حفظ الملف مؤقتاً
+    file_path = f"./{file.filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # هنا تستدعي الدالة التي تقوم بتقطيع الـ PDF وعمل الـ Vector Index
+    # مثال: process_pdf_to_vector_db(file_path)
+    
+    return {"message": f"File {file.filename} uploaded and indexed successfully!"}
 
 @app.post("/ask")
 def ask(req: AskRequest, current_user: dict = Depends(get_current_user)):
