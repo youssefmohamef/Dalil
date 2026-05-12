@@ -1,11 +1,8 @@
-# main.py
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+# IMPORTS
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
+
 import os
 import shutil
 from dotenv import load_dotenv
@@ -21,11 +18,12 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
 # ============================================================
 # PATHS
 # ============================================================
 BASE_PATH = os.getcwd()
-SOURCE_DATA_PATH = os.path.join(BASE_PATH, "Source_data")
+SOURCE_DATA_PATH = os.path.join(BASE_PATH, "data", "Source_data")
 VECTOR_DB_PATH   = os.path.join(BASE_PATH, "vector_db_index")
 LOG_FILE_PATH    = os.path.join(BASE_PATH, "admin_knowledge_base.txt")
 
@@ -53,7 +51,7 @@ def get_or_create_vectorstore(embedding_model):
             import shutil
             shutil.rmtree(VECTOR_DB_PATH)
     print("🆕 Building vector database...")
-    all_docs = []
+    all_docs = []   
     if os.path.exists(SOURCE_DATA_PATH):
         all_docs.extend(DirectoryLoader(SOURCE_DATA_PATH, glob="*.pdf", loader_cls=PyPDFLoader).load())
         all_docs.extend(DirectoryLoader(SOURCE_DATA_PATH, glob="*.csv", loader_cls=CSVLoader, loader_kwargs={"encoding": "utf-8"}).load())
@@ -116,23 +114,86 @@ print("✅ RAG chain ready.")
 # ============================================================
 # CHAT FUNCTION
 # ============================================================
-chat_history = []
-
 def chat(question):
-    global chat_history
-    result = rag_chain.invoke({
-        "input": question,
-        "chat_history": chat_history
+
+    docs = retriever.get_relevant_documents(
+        question
+    )
+
+    # ============================================
+    # detect deleted entities
+    # ============================================
+    deleted_entities = []
+
+    for d in docs:
+
+        content = d.page_content.lower()
+
+        if content.startswith("deleted info:"):
+
+            deleted_name = (
+                content
+                .replace("deleted info:", "")
+                .strip()
+                .split(",")[0]
+            )
+
+            deleted_entities.append(
+                deleted_name
+            )
+
+    # ============================================
+    # filter deleted docs
+    # ============================================
+    filtered_docs = []
+
+    for d in docs:
+
+        content_lower = d.page_content.lower()
+
+        is_deleted_related = False
+
+        for deleted_name in deleted_entities:
+
+            if (
+                deleted_name in content_lower
+                and not content_lower.startswith("deleted info:")
+            ):
+
+                is_deleted_related = True
+                break
+
+        if not is_deleted_related:
+
+            filtered_docs.append(d)
+
+    # ============================================
+    # if no valid docs
+    # ============================================
+    if not filtered_docs:
+
+        return (
+            "I could not find the answer "
+            "in the database."
+        )
+
+    # ============================================
+    # invoke chain manually
+    # ============================================
+    result = document_chain.invoke({
+
+        "context": filtered_docs,
+
+        "input": question
+
     })
-    answer = result["answer"]
-    chat_history.append({"user": question})
-    chat_history.append({"assistant": answer})
-    return answer
+
+    return result
 
 # ============================================================
 # ADMIN ENGINE
 # ============================================================
-def internal_selective_delete(name, category=""):
+def save_admin_log(name, category=""):
     global vectorstore
     if os.path.exists(LOG_FILE_PATH):
         with open(LOG_FILE_PATH, "r", encoding="utf-8") as f:
@@ -146,87 +207,149 @@ def internal_selective_delete(name, category=""):
         return True
     return False
 
-def dalil_main_engine(user_input, is_admin=False):
+def dalil_main_engine(user_input):
+
     global vectorstore
-    if is_admin:
-        if user_input.lower().startswith("delete:"):
-            target = user_input.replace("delete:", "").strip()
-            internal_selective_delete(target, "")
-            return f"🗑️ Records for '{target}' removed from overrides."
-        elif user_input.lower().startswith("insert:"):
-            try:
-                content = user_input.replace("insert:", "").strip()
-                parts   = [p.strip() for p in content.split(",")]
-                if len(parts) >= 3:
-                    name, category, value = parts[0], parts[1], parts[2]
-                    new_record = f"UPDATED INFO: {name}'s {category} is {value}"
-                    internal_selective_delete(name, category)
-                    vectorstore.add_documents([Document(page_content=new_record)])
-                    vectorstore.save_local(VECTOR_DB_PATH)
-                    with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-                        f.write(new_record + "\n")
-                    return f"✅ Successfully Inserted: {name}'s {category} record."
-                return "⚠️ Format Error! Use: insert: Name, Category, Value"
-            except Exception as e:
-                return f"❌ System Error: {str(e)}"
-    docs    = vectorstore.similarity_search(user_input, k=5)
-    context = "\n".join([d.page_content for d in docs])
-    system_instruction = (
-        "You are an expert assistant. Use the provided context to answer. "
-        "IMPORTANT: If you find conflicting information, prioritize records labeled 'UPDATED INFO'."
-    )
-    final_prompt = f"{system_instruction}\n\nContext:\n{context}\n\nQuestion: {user_input}"
-    return llm.invoke(final_prompt).content
+
+    # INSERT
+    # ========================================================
+    if user_input.lower().startswith("insert:"):
+
+        try:
+
+            content = user_input.replace(
+                "insert:","").strip()
+
+            parts = [
+                p.strip()
+                for p in content.split(",")
+            ]
+
+            if len(parts) < 3:
+
+                return (
+                    "❌ Use format:\n"
+                    "insert: name, category, value"
+                )
+
+            name = parts[0]
+            category = parts[1]
+            value = parts[2]
+
+            new_record = (
+                f"UPDATED INFO: "
+                f"{name}'s {category} is {value}"
+            )
+
+            vectorstore.add_documents([
+                Document(
+                    page_content=new_record
+                )
+            ])
+
+            vectorstore.save_local(
+                VECTOR_DB_PATH
+            )
+
+            save_admin_log(new_record)
+
+            return (
+                f"✅ Inserted successfully:\n"
+                f"{new_record}"
+            )
+
+        except Exception as e:
+
+            return f"❌ Error: {str(e)}"
+
+    # UPDATE
+    # ========================================================
+    elif user_input.lower().startswith("update:"):
+
+        try:
+
+            content = user_input.replace(
+                "update:","").strip()
+
+            parts = [
+                p.strip()
+                for p in content.split(",")
+            ]
+
+            if len(parts) < 3:
+
+                return (
+                    "❌ Use format:\n"
+                    "update: name, category, new_value"
+                )
+
+            name = parts[0]
+            category = parts[1]
+            new_value = parts[2]
+
+            updated_record = (
+                f"UPDATED INFO: "
+                f"{name}'s {category} is {new_value}"
+            )
+
+            vectorstore.add_documents([
+                Document(
+                    page_content=updated_record
+                )
+            ])
+
+            vectorstore.save_local(
+                VECTOR_DB_PATH
+            )
+
+            save_admin_log(updated_record)
+
+            return (
+                f"✅ Updated successfully:\n"
+                f"{updated_record}"
+            )
+
+        except Exception as e:
+
+            return f"❌ Error: {str(e)}"
+
+    # DELETE
+    # ========================================================
+    elif user_input.lower().startswith("delete:"):
+
+        try:
+
+            target = user_input.replace(
+                "delete:","").strip()
+
+            delete_record = (f"DELETED INFO: {target}")
+
+            vectorstore.add_documents([
+                Document(
+                    page_content=delete_record
+                )
+            ])
+
+            vectorstore.save_local(
+                VECTOR_DB_PATH
+            )
+
+            save_admin_log(delete_record)
+
+            return (
+                f"✅ Delete marker added for:\n"
+                f"{target}"
+            )
+
+        except Exception as e:
+
+            return f"❌ Error: {str(e)}"
+
+    return "❌ Unknown command."
 
 # ============================================================
-# AUTH SETUP
+# # FASTAPI APP INITIALIZATION
 # ============================================================
-print("⏳ Setting up auth...")
-SECRET_KEY           = "dalil-super-secret-key-change-in-production"
-ALGORITHM            = "HS256"
-TOKEN_EXPIRE_MINUTES = 60
-
-pwd_context   = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-print("⏳ Hashing passwords...")
-USERS_DB = {
-    "admin": {
-        "username": "admin",
-        "password": pwd_context.hash("admin123"),
-        "role": "admin"
-    },
-    "student": {
-        "username": "student",
-        "password": pwd_context.hash("student123"),
-        "role": "user"
-    }
-}
-print("✅ Auth ready.")
-
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
-
-def create_token(data: dict):
-    to_encode = data.copy()
-    to_encode["exp"] = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        role     = payload.get("role")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return {"username": username, "role": role}
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# ============================================================
-# FASTAPI APP
-# ============================================================
-print("⏳ Starting FastAPI app...")
 app = FastAPI(title="Dalil University Assistant API")
 
 app.add_middleware(
@@ -236,93 +359,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# REQUEST MODELS
+# API MODELS
 # ============================================================
 class AskRequest(BaseModel):
+    """Schema for AI chatbot queries."""
     question: str
 
 class AdminRequest(BaseModel):
+    """Schema for administrative database commands."""
     command: str
-
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    role: str = "user"
 
 # ============================================================
 # ENDPOINTS
 # ============================================================
-
 @app.get("/")
 def root():
-    return {"status": "✅ Dalil API is running"}
-
-@app.post("/register")
-def register(req: RegisterRequest):
-    if req.username in USERS_DB:
-        raise HTTPException(status_code=400, detail="Username already exists")
-    if req.role not in ["user", "admin"]:
-        raise HTTPException(status_code=400, detail="Role must be 'user' or 'admin'")
-    USERS_DB[req.username] = {
-        "username": req.username,
-        "password": pwd_context.hash(req.password),
-        "role": req.role
-    }
-    return {
-        "message": f"✅ User '{req.username}' registered successfully",
-        "role": req.role
-    }
-
-@app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = USERS_DB.get(form_data.username)
-    if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Wrong username or password")
-    token = create_token({"sub": user["username"], "role": user["role"]})
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "role": user["role"],
-        "username": user["username"]
-    }
-
-@app.post("/admin/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...)):
-    # حفظ الملف مؤقتاً
-    file_path = f"./{file.filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # هنا تستدعي الدالة التي تقوم بتقطيع الـ PDF وعمل الـ Vector Index
-    # مثال: process_pdf_to_vector_db(file_path)
-    
-    return {"message": f"File {file.filename} uploaded and indexed successfully!"}
+    """Health check endpoint."""
+    return {"status": "✅ Dalil API is running", "timestamp": datetime.utcnow()}
 
 @app.post("/ask")
-def ask(req: AskRequest, current_user: dict = Depends(get_current_user)):
+def ask(req: AskRequest):
+
+    forbidden_commands = [
+        "insert:",
+        "update:",
+        "delete:"
+    ]
+
+    question_lower = req.question.lower()
+
+    for cmd in forbidden_commands:
+
+        if question_lower.startswith(cmd):
+
+            raise HTTPException(
+                status_code=403,
+                detail=("Admin commands are forbidden"
+                        "❌ Admin commands "
+            )
+            )
     answer = chat(req.question)
-    return {
-        "answer": answer,
-        "asked_by": current_user["username"],
-        "role": current_user["role"]
-    }
 
+    return {
+        "answer": answer
+    }
+# ADMIN COMMAND ENDPOINT
+# ============================================================
 @app.post("/admin/command")
-def admin_command(req: AdminRequest, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="❌ Admins only. Access denied.")
-    result = dalil_main_engine(req.command, is_admin=True)
-    return {
-        "result": result,
-        "executed_by": current_user["username"]
-    }
+def admin_command(req: AdminRequest):
 
-@app.get("/me")
-def get_me(current_user: dict = Depends(get_current_user)):
+    result = dalil_main_engine(
+        req.command
+    )
+
     return {
-        "username": current_user["username"],
-        "role": current_user["role"]
+        "result": result
     }
 
 # ============================================================

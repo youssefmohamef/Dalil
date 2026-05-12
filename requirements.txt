@@ -10,6 +10,8 @@ langchain-community
 langchain-core
 langchain-text-splitters
 langchain-groq
+pyjwt
+pydantic
 
 faiss-cpu
 sentence-transformers
